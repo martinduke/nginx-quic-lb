@@ -34,6 +34,8 @@ stream {
 }
 ```
 
+This example specifies support for three different configurations, each assigned to a config rotation codepoint. Each of these configurations, in this example, uses a different algorithm. In general, you would only need one quic-lb line in a production load balancer and would only add a second line when rotating keys in your server pool (see section 3.1 of the spec for more on this).
+
 Then type
 
 ```
