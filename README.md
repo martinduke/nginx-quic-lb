@@ -6,6 +6,7 @@ See https://quicwg.org/load-balancers/draft-ietf-quic-load-balancers.html for th
 # Installation instructions
 
 ```
+sudo apt install gcc make libssl-dev
 git clone https://github.com/martinduke/nginx-quic-lb.git
 cd nginx-quic-lb
 ./auto/configure <flags>
@@ -33,15 +34,24 @@ stream {
 }
 ```
 
+Then type
+
+```
+sudo nginx
+```
+
+to start the server
+
 ## Notes
 [1] See https://nginx.org/en/docs/configure.html for configure flags. One string that has the necessary flags is
 
 ```
---prefix=/etc/nginx --sbin-path=/usr/xbin/nginx --modules-path=/usr/lib/nginx/modules --conf-path=/etc/nginx/nginx.conf
+--prefix=/etc/nginx --sbin-path=/usr/sbin/nginx --modules-path=/usr/lib/nginx/modules --conf-path=/etc/nginx/nginx.conf
 --error-log-path=/var/log/nginx/error.log --pid-path=/var/run/nginx.pid --lock-path=/var/run/nginx.lock --user=nginx
 --group=nginx --build=Ubuntu --builddir=builds --with-stream --with-openssl=/usr/bin --without-http_rewrite_module
+--without-http_gzip_module
 ```
-There is probably a smaller minimum set, but this one works in Ubuntu
+There is probably a smaller minimum set, but this one works for sure in Ubuntu
 
 [2] There can be up to three quic-lb commands, each corresponding to a different algorithm & settings the load balancer is executing. Possible parameters:
 * "cr": Config Rotation (Integer from 0 to 2 inclusive). The load balancer will apply the configuration in that line to any compliant Connection ID whose first two bits matches this parameter.
@@ -51,3 +61,32 @@ There is probably a smaller minimum set, but this one works in Ubuntu
 
 [3] Each server can be assigned between 1 and 3 Server IDs (sid0, sid1, sid2). The integer index indicates the config which uses this assignment. This is a hexidecimal representation of the opaque field. There must be exactly twice as many characters as the sidl of the associated configuration.
 
+# Testing
+
+A very quick test is to fill in fields in the nginx.conf file above as follows:
+
+```
+server localhost:4434 sid0=41414141;
+server localhost:4435 sid0=42424242;
+...
+listen 443 udp;
+```
+
+and then you can type
+
+```
+tcpdump -i lo udp
+nc -u localhost 443
+00AAAAfoo
+^c
+nc -u localhost 443
+00BBBBfoo
+```
+
+If everything is working correctly, cr=0 is the Plaintext CID algorithm with a 4-byte server ID. The two "servers" have server IDs easily expressible in ASCII.
+
+Netcat will send a 10-byte UDP payload that is long enough for the proxy to extract the server ID. The tcpdump should show a UDP packet arrive on port 443 and be routed to 4434.
+Closing netcat is necessary to set a new port so that later datagrams are sent to the same server.
+Then a second call with SID BBBB will be routed to 4435.
+
+Other SIDs will be routed using NGINX's Round Robin algorithm, as there is no server mapping.
