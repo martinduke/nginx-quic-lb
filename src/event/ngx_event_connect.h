@@ -68,6 +68,11 @@ struct ngx_peer_connection_s {
                                      /* ngx_connection_log_error_e */
     unsigned                         log_error:2;
 
+    /* QUIC_LB dynamic allocation specific data */
+    void                            *sid_node;
+    u_char                           cid[20];
+    u_char                           cidl;
+
     NGX_COMPAT_BEGIN(2)
     NGX_COMPAT_END
 };
