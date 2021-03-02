@@ -74,7 +74,12 @@ server localhost:4435 sid0=42424242;
 listen 443 udp;
 ```
 
-and then you can type
+As you're not listening on 4434 or 4435, it will help to disable the ICMP destination unreachable so that NGINX doesn't give up on the server:
+```
+sudo iptables -I OUTPUT -p icmp --icmp-type destination-unreachable -j DROP
+```
+
+Then you can type
 
 ```
 tcpdump -i lo udp
