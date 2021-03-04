@@ -36,13 +36,20 @@ stream {
 
 This example specifies support for three different configurations, each assigned to a config rotation codepoint. Each of these configurations, in this example, uses a different algorithm. In general, you would only need one quic-lb line in a production load balancer and would only add a second line when rotating keys in your server pool (see section 3.1 of the spec for more on this).
 
+For dynamic SID allocation, simply add a parameter 'lb-timeout' to one or more
+of the quic-lb lines, with a value (in seconds) greater than zero and responding
+to how long a SID allocation can be unused before returning to the pool. For a
+cr that is dynamically allocated, you need not assign an SID. For example, if
+cr=1 has a nonzero lb-timeout value, there is no need to attach an sid1
+parameter to any pool member.
+
 Then type
 
 ```
 sudo nginx
 ```
 
-to start the server
+to start the server.
 
 ## Notes
 [1] See https://nginx.org/en/docs/configure.html for configure flags. One string that has the necessary flags is
