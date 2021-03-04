@@ -44,6 +44,22 @@ sudo nginx
 
 to start the server
 
+## Retry Services
+in the "upstream server_pool" block, you can add this line:
+
+```
+        quic-lb retry-service key=1234567890abcdef1234567890abcdef iv=1234567890abcdef;
+```
+
+This instantiates a non-shared-state Retry Service that always sends Retry in
+response to an Initial unless that Initial contains a valid token. It always
+admits QUIC versions other than 1. If admitted, the packet will pass to the
+load balancing logic to route. There MUST be at least one QUIC-LB load
+balancing configuration in the block as well.
+
+The key and iv are for internal use, so that the service can authenticate its
+own tokens, and need not be shared with other entities.
+
 ## Notes
 [1] See https://nginx.org/en/docs/configure.html for configure flags. One string that has the necessary flags is
 
