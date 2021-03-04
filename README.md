@@ -45,7 +45,8 @@ sudo nginx
 to start the server
 
 ## Retry Services
-in the "upstream server_pool" block, you can add this line:
+
+In the "upstream server_pool" block, you can add this line:
 
 ```
         quic-lb retry-service key=1234567890abcdef1234567890abcdef iv=1234567890abcdef;
@@ -58,7 +59,8 @@ load balancing logic to route. There MUST be at least one QUIC-LB load
 balancing configuration in the block as well.
 
 The key and iv are for internal use, so that the service can authenticate its
-own tokens, and need not be shared with other entities.
+own tokens, and need not be shared with other entities. The key is always
+16 bytes and the iv is always 8 bytes.
 
 ## Notes
 [1] See https://nginx.org/en/docs/configure.html for configure flags. One string that has the necessary flags is
@@ -108,3 +110,7 @@ Closing netcat is necessary to set a new port so that later datagrams are sent t
 Then a second call with SID BBBB will be routed to 4435.
 
 Other SIDs will be routed using NGINX's Round Robin algorithm, as there is no server mapping.
+
+Netcat is impractical for testing Retry Services due to the variable packet
+contents and the short token expiration time. It is best tested with a full
+QUIC client implementation.
