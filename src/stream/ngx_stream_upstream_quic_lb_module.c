@@ -16,26 +16,34 @@ typedef struct {
     ngx_rbtree_node_t                     sentinel;
 } ngx_stream_upstream_quic_lb_server_tree_t;
 
+/* One assignment of SID to peer, in the red-black tree */
 typedef struct {
     ngx_rbtree_node_t                     rbnode;
     u_char                                sid[QUIC_LB_MAX_CID_LEN];
     ngx_stream_upstream_rr_peer_t        *peer;
 } ngx_stream_upstream_quic_lb_server_node_t;
 
+/* Global configuration */
 typedef struct {
     void                                     *quic_lb_ctx[3];
     ngx_int_t                                 min_cidl[3];
     ngx_stream_upstream_quic_lb_server_tree_t tree[3];
+    ngx_int_t                                 retry_service; /* Boolean */
+    u_char                                    retry_key[16];
+    u_char                                    retry_iv[8];
 } ngx_stream_upstream_quic_lb_srv_conf_t;
 
+/* Passed up on every connect event, provides access to all you need */
 typedef struct {
     /* the round robin data must be first */
     ngx_stream_upstream_rr_peer_data_t      rrp;
     ngx_stream_upstream_quic_lb_srv_conf_t *conf;
-    ngx_buf_t                              *pkt;
+    ngx_connection_t                       *connection; /* Clientside conn */
     ngx_event_get_peer_pt                   get_rr_peer;
 } ngx_stream_upstream_quic_lb_peer_data_t;
 
+extern ngx_int_t ngx_retry_service_process_initial(ngx_connection_t *c,
+        u_char *key, u_char *iv);
 
 static ngx_int_t ngx_stream_upstream_init_quic_lb_peer(ngx_stream_session_t *s,
     ngx_stream_upstream_srv_conf_t *us);
@@ -172,7 +180,7 @@ ngx_stream_upstream_init_quic_lb_peer(ngx_stream_session_t *s,
     s->upstream->peer.get = ngx_stream_upstream_get_quic_lb_peer;
 
     qlbp->conf = qlbcf;
-    qlbp->pkt = s->connection->buffer; /* Store UDP packet for inspection */
+    qlbp->connection = s->connection;
     qlbp->get_rr_peer = ngx_stream_upstream_get_round_robin_peer;
 
     ngx_stream_upstream_rr_peers_unlock(qlbp->rrp.peers);
@@ -187,7 +195,7 @@ ngx_stream_upstream_get_quic_lb_peer(ngx_peer_connection_t *pc, void *data)
     ngx_stream_upstream_quic_lb_peer_data_t *qlbp = data;
 
     time_t                                     now;
-    u_char                                    *cid = qlbp->pkt->pos;
+    u_char                                    *cid;
     u_char                                     sid[QUIC_LB_MAX_CID_LEN];
     ngx_uint_t                                 sidl;
     ngx_uint_t                                 long_hdr;
@@ -200,14 +208,22 @@ ngx_stream_upstream_get_quic_lb_peer(ngx_peer_connection_t *pc, void *data)
 
     ngx_log_debug1(NGX_LOG_DEBUG_STREAM, pc->log, 0,
                    "get quic-lb peer, try: %ui", pc->tries);
+    if (qlbp->conf->retry_service && (ngx_retry_service_process_initial(
+            qlbp->connection, qlbp->conf->retry_key, qlbp->conf->retry_iv)
+            == NGX_DECLINED)) {
+        /* No Retry token, or an invalid one. We may have sent a Retry, but
+           abort the stream. */
+        return NGX_ERROR;
+    }
 
     ngx_stream_upstream_rr_peers_rlock(qlbp->rrp.peers);
     now = ngx_time();
     pc->connection = NULL;
 
+    cid = qlbp->connection->buffer->pos;
     /* Find the CID */
     long_hdr = *cid & 0x80;
-    if ((qlbp->pkt->last - cid) < (long_hdr ? 7 : 2)) {
+    if ((qlbp->connection->buffer->last - cid) < (long_hdr ? 7 : 2)) {
         goto round_robin; /* Can't even find a first CID byte */
     }
     cid++;
@@ -216,8 +232,8 @@ ngx_stream_upstream_get_quic_lb_peer(ngx_peer_connection_t *pc, void *data)
     }
     /* cid now points to the connection ID */
     config_rot = (*cid & 0xc0) >> 6;
-    if ((config_rot == 3) ||
-            ((qlbp->pkt->last - cid) < qlbp->conf->min_cidl[config_rot]) ||
+    if ((config_rot == 3) || ((qlbp->connection->buffer->last - cid) <
+            qlbp->conf->min_cidl[config_rot]) ||
             (qlbp->conf->quic_lb_ctx[config_rot] == NULL)) {
         goto round_robin;
     }
@@ -338,13 +354,14 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_stream_upstream_quic_lb_srv_conf_t  *qlbcf = conf;
 
-    ngx_int_t                            cr = -1;
     ngx_str_t                           *value;
     ngx_stream_upstream_srv_conf_t      *uscf;
     enum quic_lb_alg                     alg;
     ngx_int_t                            sidl = -1, nonce_len = -1, byte = -1;
-    ngx_uint_t                            i, j;
-    u_char                               key[16];
+    ngx_int_t                            iv_byte = -1, cr = -1;
+    ngx_int_t                            retry_service = 0;
+    ngx_uint_t                           i, j;
+    u_char                               key[16], iv[8];
 
     value = cf->args->elts;
 
@@ -383,6 +400,24 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     /* Allow parameters in any order */
     for (i = 1; i < cf->args->nelts; i++) {
+
+        if (ngx_strncmp(value[i].data, "retry-service", 13) == 0) {
+            /* It's a retry service, ignore the rest */
+            retry_service = 1;
+            continue;
+        }
+
+        if (ngx_strncmp(value[i].data, "iv=", 3) == 0) {
+            for (j = 0; j < 8; j++) {
+                iv_byte = ngx_hextoi(&value[i].data[3 + j*2], 2);
+                if (iv_byte == NGX_ERROR) {
+                    printf("byte = %ld\n", byte);
+                    goto invalid;
+                }
+                iv[j] = (u_char)iv_byte;
+            }
+            continue;
+        } 
 
         if (ngx_strncmp(value[i].data, "cr=", 3) == 0) {
             cr = ngx_atoi(&value[i].data[3], value[i].len - 3);
@@ -434,6 +469,19 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             continue;
         }
 
+    }
+
+    if (retry_service) {
+        /* Do Retry Service stuff, skip the rest */
+        if ((byte == -1) || (iv_byte == -1)) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "Missing key or iv for retry token");
+            return NGX_CONF_ERROR;
+        }
+        qlbcf->retry_service = 1;
+        memcpy(qlbcf->retry_key, key, 16);
+        memcpy(qlbcf->retry_iv, iv, 8);
+        return NGX_CONF_OK;
     }
 
     /* Make sure we got the right parameters */
