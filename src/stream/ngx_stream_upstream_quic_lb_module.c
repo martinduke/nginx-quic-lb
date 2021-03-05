@@ -257,6 +257,10 @@ ngx_stream_upstream_get_quic_lb_peer(ngx_peer_connection_t *pc, void *data)
         node = (compare < 0) ? node->left : node->right;
     }
     if (node == sentinel) {
+        /* If a short header, CID should be compliant. Drop instead */
+        if (!long_hdr) {
+            return NGX_ERROR;
+        }
         goto round_robin; /* Invalid SID */
     }
 
