@@ -266,9 +266,18 @@ ngx_retry_service_process_initial(ngx_connection_t *c, u_char *key, u_char *iv)
         return NGX_DECLINED;
     }
     if ((*read & 0x80) == 0) {
+        /*
+           XXX Admit all short headers arriving first on the four-tuple. This
+           preserves address migration while putting some more stress on the
+           servers we're protecting. An improvement would be to use QUIC-LB to
+           admit only CIDs with a valid SID.
+        */
+        return NGX_OK;
+#if 0
         ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
                 "retry dropping short header");
         return NGX_DECLINED; /* Drop short headers */
+#endif
     }
     pkt_type = (*read & 0x30) >> 4; 
     if (pkt_type != NGX_QUIC_LB_INITIAL) {
