@@ -127,3 +127,7 @@ Netcat is impractical for testing Retry Services due to the variable packet
 contents and the short token expiration time. It is best tested with a full
 QUIC client implementation or a socket program that models the necessary
 behavior.
+
+Dynamic Allocation also requires a more complicated test. It has hard to create
+a long header packet in ASCII. As there are no compliant DCIDs at first, NGINX
+will reject short header packets.
