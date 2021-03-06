@@ -125,4 +125,5 @@ Other SIDs will be routed using NGINX's Round Robin algorithm, as there is no se
 
 Netcat is impractical for testing Retry Services due to the variable packet
 contents and the short token expiration time. It is best tested with a full
-QUIC client implementation.
+QUIC client implementation or a socket program that models the necessary
+behavior.
