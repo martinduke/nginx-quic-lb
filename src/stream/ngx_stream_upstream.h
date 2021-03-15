@@ -25,6 +25,7 @@
 
 
 #define NGX_STREAM_UPSTREAM_NOTIFY_CONNECT     0x1
+#define NGX_STREAM_UPSTREAM_NOTIFY_FORWARD     0x2
 
 
 typedef struct {

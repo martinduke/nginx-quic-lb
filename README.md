@@ -36,13 +36,20 @@ stream {
 
 This example specifies support for three different configurations, each assigned to a config rotation codepoint. Each of these configurations, in this example, uses a different algorithm. In general, you would only need one quic-lb line in a production load balancer and would only add a second line when rotating keys in your server pool (see section 3.1 of the spec for more on this).
 
+For dynamic SID allocation, simply add a parameter 'lb-timeout' to one or more
+of the quic-lb lines, with a value (in seconds) greater than zero and responding
+to how long a SID allocation can be unused before returning to the pool. For a
+cr that is dynamically allocated, you need not assign an SID. For example, if
+cr=1 has a nonzero lb-timeout value, there is no need to attach an sid1
+parameter to any pool member.
+
 Then type
 
 ```
 sudo nginx
 ```
 
-to start the server
+to start the server.
 
 ## Retry Services
 
@@ -118,4 +125,9 @@ Other SIDs will be routed using NGINX's Round Robin algorithm, as there is no se
 
 Netcat is impractical for testing Retry Services due to the variable packet
 contents and the short token expiration time. It is best tested with a full
-QUIC client implementation.
+QUIC client implementation or a socket program that models the necessary
+behavior.
+
+Dynamic Allocation also requires a more complicated test. It has hard to create
+a long header packet in ASCII. As there are no compliant DCIDs at first, NGINX
+will reject short header packets.
