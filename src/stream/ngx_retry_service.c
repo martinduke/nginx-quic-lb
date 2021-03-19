@@ -4,8 +4,8 @@
  * Copyright (C) F5 Networks, Inc.
  */
 
-
 #include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <ngx_core.h>
 #include <openssl/evp.h>
@@ -119,46 +119,80 @@ fail:
 }
 
 
-/* Returns length of token */
+/* Returns length of token. If key_seq == NULL, it's non-shared-state. */
 static ngx_uint_t
-ngx_retry_service_build_non_shared_state_token(ngx_connection_t *c,
-        u_char *token, u_char odcil, u_char rscil, u_char *odcid,
-        u_char *rscid, u_char *key, u_char *iv)
+ngx_retry_service_build_token(ngx_connection_t *c, u_char *token,
+        u_char odcil, u_char rscil, u_char *odcid, u_char *rscid,
+        u_char *key, u_char *iv, u_char *key_seq)
 {
     time_t  expiration;
-    int     len;
+    int     len, i;
     u_char  full_iv[16], tag[16], scratch[255];;
     u_char *pt, *token_start, *write = scratch;
 
     /* Token pseudoheader, not on the wire */
     switch(c->sockaddr->sa_family) {
     case AF_INET:
-        memcpy(write, c->sockaddr, sizeof(struct sockaddr_in));
-        write += sizeof(struct sockaddr_in);
+        memcpy(write, &((struct sockaddr_in *)(c->sockaddr))->sin_addr, 4);
+        write += 4;
+        memset(write, 0, 12);
+        write += 12;
         break;
     case AF_INET6:
-        memcpy(write, c->sockaddr, sizeof(struct sockaddr_in6));
-        write += sizeof(struct sockaddr_in6);
+        memcpy(write, &((struct sockaddr_in6 *)(c->sockaddr))->sin6_addr, 16);
+        write += 16;
         break;
     default:
         return 0; /* No address to verify! */
     }
     token_start = write;
-    *write = odcil & 0x7f;
+    if (key_seq != NULL) {
+        for (len = 0; len < 12; len += sizeof(int)) { /* Unique token number */
+            *(int *)(write + len) = rand();
+        }
+        write += 12;
+        *write = *key_seq;
+        write++;
+        pt = write;
+        *write = odcil;
+    } else {
+        *write = odcil & 0x7f;
+    }
     write++;
     *write = rscil;
     write++;
+    if (key_seq != NULL) {
+        if (c->sockaddr->sa_family == AF_INET) {
+            memcpy(write, &((struct sockaddr_in *)(c->sockaddr))->sin_port, 2);
+        } else {
+            memcpy(write, &((struct sockaddr_in6 *)(c->sockaddr))->sin6_port,
+                    2);
+        }
+        write += 2;
+    }
     memcpy(write, odcid, odcil);
     write += odcil;
     memcpy(write, rscid, rscil);
     write += rscil;
+    if (key_seq == NULL) {
+        for (len = 0; len < 12; len += sizeof(int)) { /* Unique token number */
+            *(int *)(write + len) = rand();
+        }
+        write += 12;
+        pt = write;
+    }
     expiration = ngx_time() + NGX_QUIC_LB_TOKEN_TIMEOUT;
-    pt = write;
     memcpy(write, &expiration, sizeof(expiration));
     write += sizeof(expiration);
     /* Encrypt Token */
-    memcpy(full_iv, iv, 8);
-    memcpy(full_iv + 8, rscid, NGX_QUIC_LB_RSCIL);
+    memcpy(full_iv, iv, 16);
+    for (i = 0; i < 12; i++) { /* XOR with the nonce */
+        if (key_seq != NULL) {
+            full_iv[i+4] ^= *(token_start + i);
+        } else {
+            full_iv[i+4] ^= *(pt - 12 + i);
+        }
+    }
     if (ngx_retry_service_encrypt_decrypt(1, pt, write - pt, pt, &len, scratch,
              pt - scratch, key, full_iv, 16, tag, c->log) == NGX_DECLINED) {
         return 0;
@@ -174,59 +208,108 @@ ngx_retry_service_build_non_shared_state_token(ngx_connection_t *c,
 /* Returns NGX_OK if valid, NGX_DECLINED if should trigger retry, NGX_ABORT if
    silently dropped */
 static ngx_int_t
-ngx_retry_service_validate_non_shared_state_token(ngx_connection_t *c,
-    u_char *token, uint64_t token_len, u_char *key, u_char *iv, u_char *dcid)
+ngx_retry_service_validate_token(ngx_connection_t *c, u_char *token,
+    uint64_t token_len, u_char *key, u_char *iv, u_char *key_seq, u_char *dcid)
 {
-    int     len;
-    u_char  rscid[NGX_QUIC_LB_RSCIL], pt[255], full_iv[16], scratch[255];
+    int     len, i;
+    u_char  pt[255], full_iv[16], scratch[255];
     u_char  odcil, *token_end, *read = scratch;
-
 
     switch(c->sockaddr->sa_family) {
     case AF_INET:
-        memcpy(read, c->sockaddr, sizeof(struct sockaddr_in));
-        read += sizeof(struct sockaddr_in);
+        memcpy(read, &((struct sockaddr_in *)(c->sockaddr))->sin_addr, 4);
+        read += 4;
+        memset(read, 0, 12);
+        read += 12;
         break;
     case AF_INET6:
-        memcpy(read, c->sockaddr, sizeof(struct sockaddr_in6));
-        read += sizeof(struct sockaddr_in6);
+        memcpy(read, &((struct sockaddr_in6 *)(c->sockaddr))->sin6_addr, 16);
+        read += 16;
         break;
     default:
         ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0, "mangled addr family");
-        return NGX_ABORT;
+        return NGX_ABORT; /* No address to verify! */
     }
     token_end = read + token_len;
-    memcpy(read, token, token_len); 
-    if (*read & 0x80) {
-        /* It's a NEW_TOKEN token */
-        ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0, "NEW_TOKEN token");
-        return NGX_DECLINED;
+    memcpy(read, token, token_len);
+    memcpy(full_iv, iv, 16);
+    if (key_seq != NULL) {
+        for (i = 0; i < 12; i++) {
+            full_iv[i+4] ^= *(read + i);
+        }
+        read += 12;
+        if (*read != *key_seq) {
+            return NGX_ABORT;
+        }
+        read++;
+        /* Decrypt */
+        if (ngx_retry_service_encrypt_decrypt(0, read, token_end - read - 16,
+                 pt, &len, scratch, read - scratch, key, full_iv, 16,
+                 token_end - 16, c->log) == NGX_DECLINED) {
+            ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0, "decrypt fail");
+            return NGX_ABORT;
+        }
+        read = pt;
+        odcil = *read;
+        read++;
+        if (odcil == 0) {
+            if (*read == 0) { /* NEW_TOKEN token, no port */
+                read++;
+                goto no_port;
+            } else {
+                return NGX_ABORT;
+            }
+        }
+    } else {
+        if (*read & 0x80) {
+            /* It's a NEW_TOKEN token */
+            ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0, "NEW_TOKEN token");
+            return NGX_DECLINED;
+        }
+        odcil = (*read & 0x7f);
+        read++;
     }
-    odcil = (*read & 0x7f);
-    read++;
+    if (odcil < 8) {
+        return NGX_ABORT;
+    }
     if (*read != NGX_QUIC_LB_RSCIL) {
         ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0, "Not my CID len");
         return NGX_ABORT;
     }
     read++;
+    if (key_seq != NULL) {
+        if (((c->sockaddr->sa_family == AF_INET) && memcmp(read,
+                &((struct sockaddr_in *)(c->sockaddr))->sin_port, 2) != 0) ||
+            ((c->sockaddr->sa_family == AF_INET6) && memcmp(read,
+                &((struct sockaddr_in6 *)(c->sockaddr))->sin6_port, 2) != 0)) {
+            return NGX_ABORT; /* Port doesn't match */
+        }
+        read += 2;
+    }
     read += odcil;
-    memcpy(rscid, read, NGX_QUIC_LB_RSCIL);
-    if (memcmp(dcid, rscid, NGX_QUIC_LB_RSCIL) != 0) {
+    if (memcmp(dcid, read, NGX_QUIC_LB_RSCIL) != 0) {
         ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0, "no CID match");
         return NGX_ABORT;
     }
     read += NGX_QUIC_LB_RSCIL;
-    /* Decrypt token to authenticate & check timestamp */
-    memcpy(full_iv, iv, 16 - NGX_QUIC_LB_RSCIL);
-    memcpy(full_iv + 16 - NGX_QUIC_LB_RSCIL, dcid, NGX_QUIC_LB_RSCIL);
-    if (ngx_retry_service_encrypt_decrypt(0, read, token_end - read - 16,
-             pt, &len, scratch, read - scratch, key, full_iv, 16,
-             token_end - 16, c->log) == NGX_DECLINED) {
-        ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0, "decrypt fail");
-        return NGX_ABORT;
+no_port:
+    if (key_seq == NULL) {
+        /* Decrypt token to authenticate & check timestamp */
+        for (i = 0; i < 12; i++) {
+            full_iv[i+4] ^= *(read + i);
+        }
+        read += 12;
+        if (ngx_retry_service_encrypt_decrypt(0, read, token_end - read - 16,
+                 pt, &len, scratch, read - scratch, key, full_iv, 16,
+                 token_end - 16, c->log) == NGX_DECLINED) {
+            ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0, "decrypt fail");
+            return NGX_ABORT;
+        }
+        read = pt;
     }
     /* Verify plaintext */
-    if (ngx_time() > *(time_t *)pt) {
+    if (ngx_time() > *(time_t *)read + ((key_seq != NULL) ? 2 : 0)) {
+        /* If shared-state, allow 2 seconds of drift */
         ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0, "token expire");
         return NGX_ABORT; /* Token expired */
     }
@@ -240,7 +323,8 @@ ngx_retry_service_validate_non_shared_state_token(ngx_connection_t *c,
  * Returns NGX_DECLINED to drop the packet, NGX_OK to admit it.
  */
 ngx_int_t
-ngx_retry_service_process_initial(ngx_connection_t *c, u_char *key, u_char *iv)
+ngx_retry_service_process_initial(ngx_connection_t *c, u_char *key, u_char *iv,
+        u_char *key_seq)
 {
     const u_char retry_integrity_key[] = {
         0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a,
@@ -314,8 +398,8 @@ ngx_retry_service_process_initial(ngx_connection_t *c, u_char *key, u_char *iv)
                 "pkt too short for token");
         return NGX_DECLINED;
     }
-    switch (ngx_retry_service_validate_non_shared_state_token(c, read,
-            token_len, key, iv, dcid)) {
+    switch (ngx_retry_service_validate_token(c, read, token_len, key, iv,
+            key_seq, dcid)) {
     case NGX_DECLINED:
         ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
                 "no retry token, sending retry");
@@ -352,8 +436,8 @@ send_retry:
     }
     memcpy(&retry[pos], rscid, NGX_QUIC_LB_RSCIL);
     pos += NGX_QUIC_LB_RSCIL;
-    token_len = (uint64_t)ngx_retry_service_build_non_shared_state_token(c,
-        &retry[pos], dcidl, NGX_QUIC_LB_RSCIL, dcid, rscid, key, iv);
+    token_len = (uint64_t)ngx_retry_service_build_token(c, &retry[pos], dcidl,
+            NGX_QUIC_LB_RSCIL, dcid, rscid, key, iv, key_seq);
     if (token_len == 0) {
         ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
                 "couldn't build token");
