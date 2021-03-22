@@ -32,9 +32,10 @@ typedef struct {
     ngx_uint_t                                sidl[3];
     ngx_uint_t                                lb_timeout[3];
     ngx_pool_t                               *config_pool;
-    ngx_int_t                                 retry_service; /* Boolean */
+    ngx_int_t                                 retry_service; /* 1=NSS, 2=SS */
     u_char                                    retry_key[16];
-    u_char                                    retry_iv[8];
+    u_char                                    retry_iv[16];
+    u_char                                    retry_key_seq; /* Shared state */
 } ngx_stream_upstream_quic_lb_srv_conf_t;
 
 /* Passed up on every connect event, provides access to all you need */
@@ -47,7 +48,7 @@ typedef struct {
 } ngx_stream_upstream_quic_lb_peer_data_t;
 
 extern ngx_int_t ngx_retry_service_process_initial(ngx_connection_t *c,
-        u_char *key, u_char *iv);
+        u_char *key, u_char *iv, u_char *key_seq);
 
 ngx_int_t ngx_stream_upstream_init_quic_lb_peer(ngx_stream_session_t *s,
     ngx_stream_upstream_srv_conf_t *us);
@@ -410,8 +411,9 @@ ngx_stream_upstream_get_quic_lb_peer(ngx_peer_connection_t *pc, void *data)
     ngx_log_debug1(NGX_LOG_DEBUG_STREAM, pc->log, 0,
                    "get quic-lb peer, try: %ui", pc->tries);
     if (qlbp->conf->retry_service && (ngx_retry_service_process_initial(
-            qlbp->connection, qlbp->conf->retry_key, qlbp->conf->retry_iv)
-            == NGX_DECLINED)) {
+            qlbp->connection, qlbp->conf->retry_key, qlbp->conf->retry_iv,
+            (qlbp->conf->retry_service == 1) ? NULL :
+            &qlbp->conf->retry_key_seq) == NGX_DECLINED)) {
         /* No Retry token, or an invalid one. We may have sent a Retry, but
            abort the stream. */
         return NGX_ERROR;
@@ -584,7 +586,7 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_stream_upstream_srv_conf_t      *uscf;
     enum quic_lb_alg                     alg;
     ngx_int_t                            sidl = -1, nonce_len = -1, byte = -1;
-    ngx_int_t                            lb_timeout = 0;
+    ngx_int_t                            lb_timeout = 0, key_seq = -1;
     ngx_uint_t                           i, j, nelts, sidl_limit;
     u_char                               key[16], iv[8];;
     ngx_int_t                            iv_byte = -1, cr = -1;
@@ -619,7 +621,7 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
 
         if (ngx_strncmp(value[i].data, "iv=", 3) == 0) {
-            for (j = 0; j < 8; j++) {
+            for (j = 0; j < (value[i].len - 3)/2; j++) {
                 iv_byte = ngx_hextoi(&value[i].data[3 + j*2], 2);
                 if (iv_byte == NGX_ERROR) {
                     printf("byte = %ld\n", byte);
@@ -677,6 +679,13 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 goto invalid;
             }
         }
+
+        if (ngx_strncmp(value[i].data, "retry-key-sequence=", 19) == 0) {
+            key_seq = ngx_atoi(&value[i].data[19], value[i].len - 19);
+            if ((key_seq == NGX_ERROR) || (key_seq < 0)) {
+                goto invalid;
+            }
+        }
     }
 
     /* Number of parameters defines the algorithm used */
@@ -706,6 +715,10 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         qlbcf->retry_service = 1;
         memcpy(qlbcf->retry_key, key, 16);
         memcpy(qlbcf->retry_iv, iv, 8);
+        if (key_seq > -1) {
+            qlbcf->retry_service++;
+            qlbcf->retry_key_seq = (u_char)key_seq;
+        }
         return NGX_CONF_OK;
     }
 

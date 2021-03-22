@@ -56,7 +56,7 @@ to start the server.
 In the "upstream server_pool" block, you can add this line:
 
 ```
-        quic-lb retry-service key=1234567890abcdef1234567890abcdef iv=1234567890abcdef;
+        quic-lb retry-service key=1234567890abcdef1234567890abcdef iv=1234567890abcdef0123456789abcdef;
 ```
 
 This instantiates a non-shared-state Retry Service that always sends Retry in
@@ -67,7 +67,14 @@ balancing configuration in the block as well.
 
 The key and iv are for internal use, so that the service can authenticate its
 own tokens, and need not be shared with other entities. The key is always
-16 bytes and the iv is always 8 bytes.
+16 bytes and the iv is always 16 bytes.
+
+```
+        quic-lb retry-service key=1234567890abcdef1234567890abcdef iv=1234567890abcdef0123456789abcdef retry-key-sequence=0;
+```
+
+This version instantiates shared-state Retry. Unlike the previous example, in
+this case all parameters must be shared with the server.
 
 ## Notes
 [1] See https://nginx.org/en/docs/configure.html for configure flags. One string that has the necessary flags is
