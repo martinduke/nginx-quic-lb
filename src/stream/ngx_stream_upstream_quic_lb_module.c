@@ -358,11 +358,10 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     ngx_str_t                           *value;
     ngx_stream_upstream_srv_conf_t      *uscf;
-    enum quic_lb_alg                     alg;
     ngx_int_t                            sidl = -1, nonce_len = -1, byte = -1;
     ngx_int_t                            key_seq = -1, iv_byte = -1, cr = -1;
     ngx_int_t                            retry_service = 0;
-    ngx_uint_t                           i, j, sidl_limit;
+    ngx_uint_t                           i, j;
     u_char                               key[16], iv[8];
 
     value = cf->args->elts;
@@ -383,18 +382,8 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                   |NGX_STREAM_UPSTREAM_FAIL_TIMEOUT
                   |NGX_STREAM_UPSTREAM_DOWN;
 
-    /* Number of parameters defines the algorithm used */
-    switch(cf->args->nelts) {
-    case 5:
-        alg = QUIC_LB_SCID;
-        break;
-    case 4:
-        alg = QUIC_LB_BCID;
-        break;
-    case 3:
-        alg = QUIC_LB_PCID;
-        break;
-    default:
+    /* Retry NSS and Unencrypted CID use 4 parameters, all others use 5. */
+    if (cf->args->nelts < 4 || cf->args->nelts > 5) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "Incorrect number of parameters");
         return NGX_CONF_ERROR;
@@ -431,20 +420,13 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
         if (ngx_strncmp(value[i].data, "sidl=", 5) == 0) {
             sidl = ngx_atoi(&value[i].data[5], value[i].len - 5);
-            if ((sidl == NGX_ERROR) || (sidl < 0) ||
-                    (sidl >= QUIC_LB_MAX_CID_LEN)) {
-                goto invalid;
-            }
-            if ((alg == QUIC_LB_BCID) && (sidl > 16)) {
+            if ((sidl == NGX_ERROR) || (sidl < 0)) {
                 goto invalid;
             }
             continue;
         }
 
         if (ngx_strncmp(value[i].data, "key=", 4) == 0) {
-            if (alg == QUIC_LB_PCID) {
-                continue;
-            }
             if (value[i].len < 36) {
                 goto invalid;
             }
@@ -460,12 +442,8 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
 
         if (ngx_strncmp(value[i].data, "nonce_len=", 10) == 0) {
-            if (alg != QUIC_LB_SCID) {
-                continue;
-            }
             nonce_len = ngx_hextoi(&value[i].data[10], value[i].len - 10);
-            if ((nonce_len == NGX_ERROR) || (nonce_len < 8) ||
-                    (nonce_len > 16)) {
+            if ((nonce_len == NGX_ERROR) || (nonce_len < 4)) {
                 goto invalid;
             }
             continue;
@@ -496,14 +474,6 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_OK;
     }
 
-    /* Check SID length is valid */
-    sidl_limit = ((alg == QUIC_LB_PCID) ? 16 :
-         ((alg == QUIC_LB_SCID) ? 11 : 12));
-    if (((ngx_uint_t)sidl) > sidl_limit) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "SID Length is too large");
-        return NGX_CONF_ERROR;
-    }
-
     /* Make sure we got the right parameters */
     if (cr == -1) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -515,23 +485,17 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                            "Missing server id length (sidl)");
         return NGX_CONF_ERROR;
     }
-    if ((alg > QUIC_LB_PCID) && (byte == -1)) {
+    if (nonce_len == -1) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "Missing key");
+                           "Missing nonce_len");
         return NGX_CONF_ERROR;
     }
-    if (alg == QUIC_LB_SCID) {
-        if (nonce_len == -1) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "Missing nonce_len");
-            return NGX_CONF_ERROR;
-        }
-        if ((nonce_len + sidl) >= QUIC_LB_MAX_CID_LEN) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "nonce_len + sidl is too long");
-            return NGX_CONF_ERROR;
-        }
+    if (1 + sidl + nonce_len > QUIC_LB_MAX_CID_LEN) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "Implied connection ID length is too long");
+        return NGX_CONF_ERROR;
     }
+    qlbcf->min_cidl[cr] = 1 + sidl + nonce_len;
 
     if (qlbcf->quic_lb_ctx[cr] != NULL) {
         ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
@@ -543,25 +507,14 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_rbtree_init(&qlbcf->tree[cr].rbtree, &qlbcf->tree[cr].sentinel,
             &ngx_rbtree_insert_sid);
 
-    qlbcf->quic_lb_ctx[cr] = quic_lb_lb_ctx_init(alg, FALSE, (ngx_uint_t)sidl,
-            key, (ngx_uint_t)nonce_len);
+    qlbcf->quic_lb_ctx[cr] = quic_lb_lb_ctx_init(FALSE, (ngx_uint_t)sidl,
+            (byte == -1) ? NULL : key, (ngx_uint_t)nonce_len);
     if (qlbcf->quic_lb_ctx[cr] == NULL) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "QUIC-LB config invalid");
         return NGX_CONF_ERROR;
     }
 
-    switch(alg) {
-    case QUIC_LB_PCID:
-        qlbcf->min_cidl[cr] = 1 + sidl;
-        break;
-    case QUIC_LB_BCID:
-        qlbcf->min_cidl[cr] = 17;
-        break;
-    case QUIC_LB_SCID:
-        qlbcf->min_cidl[cr] = 1 + sidl + nonce_len;
-        break;
-    }
 
     uscf->peer.init_upstream = ngx_stream_upstream_init_quic_lb;
 
