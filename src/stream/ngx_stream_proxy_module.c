@@ -1501,7 +1501,7 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
     size_t                        size, limit_rate;
     ssize_t                       n;
     ngx_buf_t                    *b;
-    ngx_int_t                     rc, do_notify = 0;
+    ngx_int_t                     rc;
     ngx_uint_t                    flags, *packets;
     ngx_msec_t                    delay;
     ngx_chain_t                  *cl, **ll, **out, **busy;
@@ -1554,10 +1554,7 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
         out = &u->upstream_out;
         busy = &u->upstream_busy;
         recv_action = "proxying and reading from client";
-        send_action = "proxying and sending to upstream";        
-        if (u->peer.notify) {
-            do_notify = 1;
-        }
+        send_action = "proxying and sending to upstream";
     }
 
     for ( ;; ) {
@@ -1609,8 +1606,6 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
 
             n = src->recv(src, b->last, size);
 
-
-
             if (n == NGX_AGAIN) {
                 break;
             }
@@ -1621,11 +1616,6 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
             }
 
             if (n >= 0) {
-                if (do_notify) {
-                    /* We got a datagram, let the upstream know */
-                    u->peer.notify(&u->peer, u->peer.data,
-                                   NGX_STREAM_UPSTREAM_NOTIFY_FORWARD);
-                }
                 if (limit_rate) {
                     delay = (ngx_msec_t) (n * 1000 / limit_rate);
 
