@@ -5,6 +5,7 @@
  */
 #ifndef _QUIC_LB_H_
 #define _QUIC_LB_H_
+#define NOBIGIP
 
 #ifdef NOBIGIP
 #include "quic_lb_types.h"
