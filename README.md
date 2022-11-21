@@ -14,6 +14,9 @@ make
 sudo make install
 ```
 
+At a minimum, you will need --with-stream and --with-stream_ssl_module for
+flags.
+
 # Config instructions
 Add something like this example to your nginx.conf file:
 
