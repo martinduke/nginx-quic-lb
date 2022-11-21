@@ -1177,7 +1177,8 @@ if [ $STREAM != NO ]; then
         ngx_module_srcs="src/stream/ngx_stream_upstream_quic_lb_module.c \
                          src/stream/ngx_retry_service.c"
         ngx_module_libs="src/stream/quic_lb.so \
-                         /usr/lib/x86_64-linux-gnu/libcrypto.so"
+                         /usr/lib/x86_64-linux-gnu/libcrypto.so \
+                         /usr/lib/x86_64-linux-gnu/libm.so"
         ngx_module_link=$STREAM_UPSTREAM_QUIC_LB
 
         . auto/module
