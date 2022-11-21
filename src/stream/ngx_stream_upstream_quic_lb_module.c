@@ -21,17 +21,13 @@ typedef struct {
     ngx_rbtree_node_t                     rbnode;
     u_char                                sid[QUIC_LB_MAX_CID_LEN];
     ngx_stream_upstream_rr_peer_t        *peer;
-    time_t                                last_time; /* Dynamic only (sec) */
 } ngx_stream_upstream_quic_lb_server_node_t;
 
 /* Global configuration */
 typedef struct {
     void                                     *quic_lb_ctx[3];
-    ngx_uint_t                                min_cidl[3];
+    ngx_int_t                                 min_cidl[3];
     ngx_stream_upstream_quic_lb_server_tree_t tree[3];
-    ngx_uint_t                                sidl[3];
-    ngx_uint_t                                lb_timeout[3];
-    ngx_pool_t                               *config_pool;
     ngx_int_t                                 retry_service; /* 1=NSS, 2=SS */
     u_char                                    retry_key[16];
     u_char                                    retry_iv[16];
@@ -44,20 +40,19 @@ typedef struct {
     ngx_stream_upstream_rr_peer_data_t      rrp;
     ngx_stream_upstream_quic_lb_srv_conf_t *conf;
     ngx_connection_t                       *connection; /* Clientside conn */
+    ngx_buf_t                              *pkt;
     ngx_event_get_peer_pt                   get_rr_peer;
 } ngx_stream_upstream_quic_lb_peer_data_t;
 
 extern ngx_int_t ngx_retry_service_process_initial(ngx_connection_t *c,
         u_char *key, u_char *iv, u_char *key_seq);
 
-ngx_int_t ngx_stream_upstream_init_quic_lb_peer(ngx_stream_session_t *s,
+static ngx_int_t ngx_stream_upstream_init_quic_lb_peer(ngx_stream_session_t *s,
     ngx_stream_upstream_srv_conf_t *us);
-ngx_int_t ngx_stream_upstream_init_quic_lb(ngx_conf_t *cf,
+static ngx_int_t ngx_stream_upstream_init_quic_lb(ngx_conf_t *cf,
     ngx_stream_upstream_srv_conf_t *us);
-ngx_int_t ngx_stream_upstream_get_quic_lb_peer(ngx_peer_connection_t *pc,
+static ngx_int_t ngx_stream_upstream_get_quic_lb_peer(ngx_peer_connection_t *pc,
     void *data);
-void ngx_stream_upstream_notify_quic_lb_peer(ngx_peer_connection_t *pc,
-    void *data, ngx_uint_t type);
 
 static char *ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
@@ -105,41 +100,16 @@ ngx_module_t  ngx_stream_upstream_quic_lb_module = {
 };
 
 
-static ngx_stream_upstream_quic_lb_server_node_t *
-ngx_stream_upstream_add_node_to_tree(ngx_pool_t *pool,
-        ngx_stream_upstream_rr_peer_t *peer,
-        ngx_stream_upstream_quic_lb_server_tree_t *tree,
-        u_char *sid, ngx_uint_t sidl, time_t timenow)
-{
-    ngx_stream_upstream_quic_lb_server_node_t *server_node;
-    ngx_rbtree_node_t                         *node;
-    size_t                                     size;
-
-    size = sizeof(ngx_stream_upstream_quic_lb_server_node_t);
-    server_node = pool ? ngx_palloc(pool, size) :
-        ngx_alloc(size, ngx_cycle->log);
-    if (server_node == NULL) {
-        return server_node;
-    }
-
-    node = &server_node->rbnode;
-    node->key = 0; /* Use the SID instead */
-    memcpy(server_node->sid, sid, sidl);
-    server_node->peer = peer;
-    server_node->last_time = timenow;
-    ngx_rbtree_insert(&tree->rbtree, node);
-    return server_node;
-}
-
-
-ngx_int_t
+static ngx_int_t
 ngx_stream_upstream_init_quic_lb(ngx_conf_t *cf,
     ngx_stream_upstream_srv_conf_t *us)
 {
     ngx_stream_upstream_quic_lb_srv_conf_t    *qlbcf;
-    ngx_stream_upstream_quic_lb_server_node_t *snode;
     ngx_stream_upstream_rr_peer_t             *peer;
     ngx_stream_upstream_rr_peers_t            *peers;
+    ngx_stream_upstream_quic_lb_server_node_t *server_node;
+    ngx_rbtree_node_t                         *node;
+    size_t                                     size;
     ngx_uint_t                                 i;
 
     ngx_log_debug0(NGX_LOG_DEBUG_STREAM, cf->log, 0, "init quic-lb");
@@ -153,25 +123,30 @@ ngx_stream_upstream_init_quic_lb(ngx_conf_t *cf,
     qlbcf = ngx_stream_conf_upstream_srv_conf(us,
             ngx_stream_upstream_quic_lb_module);
     peers = us->peer.data;
-    qlbcf->config_pool = cf->pool;
 
-    for (i = 0; i < 3; i++) {
-        if (qlbcf->quic_lb_ctx[i] == NULL) {
-            continue;
-        }
-        if (qlbcf->lb_timeout[i] > 0) {
-            /* Dynamically allocated! */
-            continue;
-        }
-        for (peer = peers->peer; peer; peer = peer->next) {
-            if (peer->sidl[i] > 0) {
-                /* Configured */
-                snode = ngx_stream_upstream_add_node_to_tree(cf->pool, peer,
-                        &(qlbcf->tree[i]), peer->sid[i], peer->sidl[i], 0);
-                if (snode == NULL) {
-                    return NGX_ERROR;
-                }
+    size = sizeof(ngx_stream_upstream_quic_lb_server_node_t);
+
+    for (peer = peers->peer; peer; peer = peer->next) {
+        for (i = 0; i < 3; i++) {
+            if (qlbcf->quic_lb_ctx[i] == NULL) {
+                continue;
             }
+            if (peer->sidl[i] == 0) {
+                /* Not configured */
+                continue;
+            }
+            server_node = cf->pool ? ngx_palloc(cf->pool, size) :
+                ngx_alloc(size, ngx_cycle->log);
+            if (server_node == NULL) {
+                return NGX_ERROR;
+            }
+
+            node = &server_node->rbnode;
+            node->key = 0; /* Use the SID instead */
+            memcpy(server_node->sid, peer->sid[i], peer->sidl[i]);
+            server_node->peer = peer;
+            ngx_rbtree_insert(&(qlbcf->tree[i].rbtree), node);
+
         }
     }
 
@@ -179,7 +154,7 @@ ngx_stream_upstream_init_quic_lb(ngx_conf_t *cf,
 }
 
 
-ngx_int_t
+static ngx_int_t
 ngx_stream_upstream_init_quic_lb_peer(ngx_stream_session_t *s,
     ngx_stream_upstream_srv_conf_t *us)
 {
@@ -205,7 +180,6 @@ ngx_stream_upstream_init_quic_lb_peer(ngx_stream_session_t *s,
     }
 
     s->upstream->peer.get = ngx_stream_upstream_get_quic_lb_peer;
-    s->upstream->peer.notify = ngx_stream_upstream_notify_quic_lb_peer;
 
     qlbp->conf = qlbcf;
     qlbp->connection = s->connection;
@@ -217,196 +191,22 @@ ngx_stream_upstream_init_quic_lb_peer(ngx_stream_session_t *s,
 }
 
 
-struct cid_metadata_t {
-    u_char     long_hdr; /* Boolean */
-    ngx_uint_t cr;
-    u_char     cid[20];
-    ngx_uint_t cidl;
-};
-
-
-/* Returns NGX_ERROR if packet should not be processed; NGX_DECLINED if we
-   cannot extract a decodable CID */
 static ngx_int_t
-ngx_stream_upstream_extract_quic_lb_cid(ngx_peer_connection_t *pc,
-       void *data, u_char *pkt_start, ngx_uint_t pkt_len,
-       struct cid_metadata_t *info)
-{
-    u_char                                   *read = pkt_start;
-    ngx_stream_upstream_quic_lb_peer_data_t  *qlbp = data;
-
-    if (pkt_len < 21) {
-        return NGX_ERROR; /* Too small to be a QUIC packet */
-    }
-    info->long_hdr = (*read & 0x80);
-    read++;
-    if (info->long_hdr) {
-       read += 4;
-       info->cidl = *read;
-       read++;
-    } else {
-       info->cidl = 21; /* More than any min_cidl */
-    }
-    info->cr = ((*read & 0xc0) >> 6);
-    if ((info->cr == 3) || (qlbp->conf->quic_lb_ctx[info->cr] == NULL)) {
-        /* We don't know how long the CID has to be */
-        return NGX_DECLINED;
-    }
-    if (info->cidl > qlbp->conf->min_cidl[info->cr]) {
-       info->cidl = qlbp->conf->min_cidl[info->cr]; /* Only need this much */
-    } else {
-       if (qlbp->conf->lb_timeout[info->cr] == 0) {
-           return NGX_DECLINED; /* Static SIDs */
-       }
-       /* It's a long header but CID isn't long enough. Just pull SIDL + 1 */
-       info->cidl = 1 + qlbp->conf->sidl[info->cr];
-    }
-    memcpy(info->cid, read, info->cidl);
-    return NGX_OK;
-}
-
-
-/* Returns length of the SID, 0 if failed. SID copied into *sid */
-static ngx_uint_t
-ngx_stream_upstream_extract_quic_lb_sid(ngx_peer_connection_t *pc,
-       void *data, struct cid_metadata_t *cid, u_char *sid)
-{
-    u_char                                   *read = cid->cid;
-    ngx_stream_upstream_quic_lb_peer_data_t  *qlbp = data;
-
-    if (cid->cidl < qlbp->conf->min_cidl[cid->cr]) {
-        if (qlbp->conf->lb_timeout[cid->cr] > 0) { /* Dynamic SIDs */
-            memcpy(sid, read+1, qlbp->conf->sidl[cid->cr]);
-            return qlbp->conf->sidl[cid->cr];
-        } else {
-            return 0; /* Cannot decode */
-        }
-    }
-    return quic_lb_decrypt_cid(qlbp->conf->quic_lb_ctx[cid->cr],
-               cid->cid, sid, NULL);
-}
-
-
-/* Returns NULL if SID is not present */
-static ngx_stream_upstream_quic_lb_server_node_t *
-ngx_stream_upstream_quic_lb_find_tree_node(u_char *sid, ngx_uint_t sidl,
-        ngx_stream_upstream_quic_lb_server_tree_t *tree, ngx_uint_t timeout)
-{
-    ngx_rbtree_node_t                         *node, *old_node;
-    ngx_stream_upstream_quic_lb_server_node_t *server;
-    ngx_int_t                                  compare;
-
-    /* Traverse the red-black tree to find the SID */
-    node = tree->rbtree.root;
-    while (node != &(tree->sentinel)) {
-        server = (ngx_stream_upstream_quic_lb_server_node_t *)node;
-        compare = ngx_memcmp(sid, server->sid, sidl);
-        if (compare == 0) {
-            break;
-        }
-        old_node = node;
-        node = (compare < 0) ? node->left : node->right;\
-        if ((timeout > 0) &&
-                ((ngx_uint_t)(ngx_time() - server->last_time) > timeout)) {
-            /* Purge expired allocations */
-            ngx_rbtree_delete(&(tree->rbtree), old_node);
-        }
-    }
-    return ((node == &(tree->sentinel)) ? NULL : server);
-}
-
-
-void
-ngx_stream_upstream_notify_quic_lb_peer(ngx_peer_connection_t *pc,
-    void *data, ngx_uint_t type)
-{
-    ngx_stream_upstream_quic_lb_peer_data_t *qlbp = data;
-    ngx_buf_t                               *buf;
-    struct cid_metadata_t                    info;
-    u_char                                   sid[20];
-    ngx_uint_t                               sidl = 0;
-    ngx_stream_upstream_quic_lb_server_node_t *server, *new_server;
-
-    if (type == NGX_STREAM_UPSTREAM_NOTIFY_FORWARD) {
-        ngx_log_debug0(NGX_LOG_DEBUG_STREAM, pc->log, 0,
-                "Notifying QUIC of new packet");
-        /* The following line is heavily dependent on downstream_buf being
-           directly below peer in ngx_stream_upstream_t */
-        buf = (ngx_buf_t *)(pc + 1);
-        switch(ngx_stream_upstream_extract_quic_lb_cid(pc, data, buf->last,
-                buf->end - buf->last, &info)) {
-        case NGX_ERROR:
-        case NGX_DECLINED:
-            /* Can't get an SID to figure out anything */
-            break;
-        case NGX_OK:
-            if (qlbp->conf->lb_timeout[info.cr] == 0) {
-                break; /* Static SIDs, nothing to do */
-            }
-            server = (ngx_stream_upstream_quic_lb_server_node_t *)
-                    (pc->sid_node);
-            if ((info.cidl == pc->cidl) && (memcmp(pc->cid, info.cid,
-                        pc->cidl) == 0)) {
-                /* CID matches, update time and we're done */
-                ngx_log_debug0(NGX_LOG_DEBUG_STREAM, pc->log, 0,
-                        "no change in SID, updating time");
-                server->last_time = ngx_time();
-                break;
-            }
-            sidl = ngx_stream_upstream_extract_quic_lb_sid(pc, data,
-                    &info, sid);
-            if (sidl == 0) {
-                break;
-            }
-            pc->cidl = info.cidl;
-            memcpy(pc->cid, info.cid, info.cidl);
-            /* Traverse the red-black tree to find the SID */
-            new_server = ngx_stream_upstream_quic_lb_find_tree_node(sid, sidl,
-                    &(qlbp->conf->tree[info.cr]),
-                    qlbp->conf->lb_timeout[info.cr]);
-            if (new_server != NULL) {
-                /* Migrating to another known SID */
-                ngx_log_debug0(NGX_LOG_DEBUG_STREAM, pc->log, 0,
-                        "Migrating peer to a known SID");
-                new_server->last_time = ngx_time();
-                pc->sid_node = new_server;
-                break;
-            }
-            /* Add allocation to the tree */
-            new_server = ngx_stream_upstream_add_node_to_tree(
-                    qlbp->conf->config_pool, server->peer,
-                    &(qlbp->conf->tree[info.cr]), sid, sidl, ngx_time());
-            if (new_server == NULL) {
-                break;
-            }
-            ngx_log_debug0(NGX_LOG_DEBUG_STREAM, pc->log, 0,
-                    "Allocating a new SID to peer mid-connection");
-            new_server->peer = server->peer;
-            new_server->last_time = ngx_time();
-            /* Copy active info into the connection */
-            pc->sid_node = new_server;
-            memcpy(pc->cid, info.cid, info.cidl);
-            pc->cidl = info.cidl;
-            break;
-        }
-    }
-}
-
-
-ngx_int_t
 ngx_stream_upstream_get_quic_lb_peer(ngx_peer_connection_t *pc, void *data)
 {
     ngx_stream_upstream_quic_lb_peer_data_t *qlbp = data;
 
     time_t                                     now;
-    struct cid_metadata_t                      info;
-    ngx_int_t                                  dynamic = 0; /* Boolean */
-    ngx_stream_upstream_rr_peer_t             *peer = NULL;
-    /* Tree traversal variables */
-    ngx_stream_upstream_quic_lb_server_node_t *server = NULL;
-    ngx_int_t                                  result;
+    u_char                                    *cid = qlbp->pkt->pos;
     u_char                                     sid[QUIC_LB_MAX_CID_LEN];
-    ngx_uint_t                                 sidl = 0;
+    ngx_uint_t                                 sidl;
+    ngx_uint_t                                 long_hdr;
+    ngx_uint_t                                 config_rot;
+    ngx_stream_upstream_rr_peer_t             *peer;
+    /* Tree traversal variables */
+    ngx_stream_upstream_quic_lb_server_node_t *server;
+    ngx_int_t                                  compare;
+    ngx_rbtree_node_t                         *node, *sentinel;
 
     ngx_log_debug1(NGX_LOG_DEBUG_STREAM, pc->log, 0,
                    "get quic-lb peer, try: %ui", pc->tries);
@@ -424,41 +224,43 @@ ngx_stream_upstream_get_quic_lb_peer(ngx_peer_connection_t *pc, void *data)
     pc->connection = NULL;
 
     /* Find the CID */
-    result = ngx_stream_upstream_extract_quic_lb_cid(pc, data,
-            qlbp->connection->buffer->pos,
-            qlbp->connection->buffer->end - qlbp->connection->buffer->pos,
-            &info);
-    if (result == NGX_ERROR) {
-        ngx_log_debug0(NGX_LOG_DEBUG_STREAM, pc->log, 0, "no cid");
-        return NGX_DECLINED; /* Not QUIC; don't process */
+    long_hdr = *cid & 0x80;
+    if ((qlbp->pkt->last - cid) < (long_hdr ? 7 : 2)) {
+        goto round_robin; /* Can't even find a first CID byte */
     }
-    if (result == NGX_DECLINED) {
-        ngx_log_debug0(NGX_LOG_DEBUG_STREAM, pc->log, 0, "no sid");
-        goto round_robin; /* Can't get an SID */
+    cid++;
+    if (long_hdr) {
+        cid += 5;
     }
-    sidl = ngx_stream_upstream_extract_quic_lb_sid(pc, data, &info, sid);
+    /* cid now points to the connection ID */
+    config_rot = (*cid & 0xc0) >> 6;
+    if ((config_rot == 3) ||
+            ((qlbp->pkt->last - cid) < qlbp->conf->min_cidl[config_rot]) ||
+            (qlbp->conf->quic_lb_ctx[config_rot] == NULL)) {
+        goto round_robin;
+    }
+    sidl = quic_lb_decrypt_cid(qlbp->conf->quic_lb_ctx[config_rot], cid, sid,
+            NULL);
     if (sidl == 0) {
         goto round_robin;
     }
-    dynamic = (qlbp->conf->lb_timeout[info.cr] > 0);
+
+
     /* Traverse the red-black tree to find the SID */
-    server = ngx_stream_upstream_quic_lb_find_tree_node(sid, sidl,
-            &(qlbp->conf->tree[info.cr]), qlbp->conf->lb_timeout[info.cr]);
-    if (server == NULL) {
-        ngx_log_debug0(NGX_LOG_DEBUG_STREAM, pc->log, 0, "not in tree");
-        if (!info.long_hdr) {
-            /* If a short header, CID should be compliant. Drop instead */
-            return NGX_ERROR;
+    node = qlbp->conf->tree[config_rot].rbtree.root;
+    sentinel = &qlbp->conf->tree[config_rot].sentinel;
+    while (node != sentinel) {
+        server = (ngx_stream_upstream_quic_lb_server_node_t *)node;
+        compare = ngx_memcmp(sid, server->sid, sidl);
+        if (compare == 0) {
+            peer = server->peer;
+            break;
         }
-        goto round_robin;
+        node = (compare < 0) ? node->left : node->right;
     }
-    /* Check for expired dynamic allocation */
-    if (dynamic && ((ngx_uint_t)(now - server->last_time) >
-            qlbp->conf->lb_timeout[info.cr])) {
-        ngx_log_debug0(NGX_LOG_DEBUG_STREAM, pc->log, 0, "expired allocation");
-        goto round_robin;
+    if (node == sentinel) {
+        goto round_robin; /* Invalid SID */
     }
-    peer = server->peer;
 
     ngx_stream_upstream_rr_peer_lock(qlbp->rrp.peers, peer);
 
@@ -494,39 +296,11 @@ ngx_stream_upstream_get_quic_lb_peer(ngx_peer_connection_t *pc, void *data)
 
     ngx_stream_upstream_rr_peer_unlock(qlbp->rrp.peers, peer);
     ngx_stream_upstream_rr_peers_unlock(qlbp->rrp.peers);
-    server->last_time = now;
-    if (dynamic) {
-        /* Copy active info into the connection */
-        pc->sid_node = server;
-        memcpy(pc->cid, info.cid, info.cidl);
-        pc->cidl = info.cidl;
-    }
 
     return NGX_OK;
 
 round_robin:
-    result = ngx_stream_upstream_get_round_robin_peer(pc, &(qlbp->rrp));
-    if ((result == NGX_OK) && dynamic) {
-        /* Dynamic; add allocation to the tree */
-        peer = qlbp->rrp.current; /* Round Robin result */
-        ngx_log_debug0(NGX_LOG_DEBUG_STREAM, pc->log, 0,
-               "assigning new SID to peer");
-        if (server == NULL) { /* Node for this SID doesn't exist */
-            server = ngx_stream_upstream_add_node_to_tree(
-                    qlbp->conf->config_pool, peer,
-                    &(qlbp->conf->tree[info.cr]), sid, sidl, now);
-            if (server == NULL) {
-                return NGX_ERROR;
-            }
-        }
-        server->peer = peer;
-        server->last_time = now;
-        /* Copy active info into the connection */
-        pc->sid_node = server;
-        memcpy(pc->cid, info.cid, info.cidl);
-        pc->cidl = info.cidl;
-    }
-    return result;
+    return ngx_stream_upstream_get_round_robin_peer(pc, &(qlbp->rrp));
 }
 
 
@@ -586,11 +360,10 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_stream_upstream_srv_conf_t      *uscf;
     enum quic_lb_alg                     alg;
     ngx_int_t                            sidl = -1, nonce_len = -1, byte = -1;
-    ngx_int_t                            lb_timeout = 0, key_seq = -1;
-    ngx_uint_t                           i, j, nelts, sidl_limit;
-    u_char                               key[16], iv[8];;
-    ngx_int_t                            iv_byte = -1, cr = -1;
+    ngx_int_t                            key_seq = -1, iv_byte = -1, cr = -1;
     ngx_int_t                            retry_service = 0;
+    ngx_uint_t                           i, j, sidl_limit;
+    u_char                               key[16], iv[8];
 
     value = cf->args->elts;
 
@@ -610,8 +383,24 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                   |NGX_STREAM_UPSTREAM_FAIL_TIMEOUT
                   |NGX_STREAM_UPSTREAM_DOWN;
 
+    /* Number of parameters defines the algorithm used */
+    switch(cf->args->nelts) {
+    case 5:
+        alg = QUIC_LB_SCID;
+        break;
+    case 4:
+        alg = QUIC_LB_BCID;
+        break;
+    case 3:
+        alg = QUIC_LB_PCID;
+        break;
+    default:
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "Incorrect number of parameters");
+        return NGX_CONF_ERROR;
+    }
+
     /* Allow parameters in any order */
-    nelts = cf->args->nelts;
     for (i = 1; i < cf->args->nelts; i++) {
 
         if (ngx_strncmp(value[i].data, "retry-service", 13) == 0) {
@@ -642,13 +431,20 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
         if (ngx_strncmp(value[i].data, "sidl=", 5) == 0) {
             sidl = ngx_atoi(&value[i].data[5], value[i].len - 5);
-            if ((sidl == NGX_ERROR) || (sidl <= 0)) {
+            if ((sidl == NGX_ERROR) || (sidl < 0) ||
+                    (sidl >= QUIC_LB_MAX_CID_LEN)) {
+                goto invalid;
+            }
+            if ((alg == QUIC_LB_BCID) && (sidl > 16)) {
                 goto invalid;
             }
             continue;
         }
 
         if (ngx_strncmp(value[i].data, "key=", 4) == 0) {
+            if (alg == QUIC_LB_PCID) {
+                continue;
+            }
             if (value[i].len < 36) {
                 goto invalid;
             }
@@ -664,6 +460,9 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
 
         if (ngx_strncmp(value[i].data, "nonce_len=", 10) == 0) {
+            if (alg != QUIC_LB_SCID) {
+                continue;
+            }
             nonce_len = ngx_hextoi(&value[i].data[10], value[i].len - 10);
             if ((nonce_len == NGX_ERROR) || (nonce_len < 8) ||
                     (nonce_len > 16)) {
@@ -672,37 +471,12 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             continue;
         }
 
-        if (ngx_strncmp(value[i].data, "lb_timeout=", 11) == 0) {
-            nelts--; /* Used for determining algorithm */
-            lb_timeout = ngx_atoi(&value[i].data[11], value[i].len - 11);
-            if ((lb_timeout == NGX_ERROR) || (lb_timeout < 0)) {
-                goto invalid;
-            }
-        }
-
         if (ngx_strncmp(value[i].data, "retry-key-sequence=", 19) == 0) {
             key_seq = ngx_atoi(&value[i].data[19], value[i].len - 19);
             if ((key_seq == NGX_ERROR) || (key_seq < 0)) {
                 goto invalid;
             }
         }
-    }
-
-    /* Number of parameters defines the algorithm used */
-    switch(nelts) {
-    case 5:
-        alg = QUIC_LB_SCID;
-        break;
-    case 4:
-        alg = QUIC_LB_BCID;
-        break;
-    case 3:
-        alg = QUIC_LB_PCID;
-        break;
-    default:
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "Incorrect number of parameters");
-        return NGX_CONF_ERROR;
     }
 
     if (retry_service) {
@@ -723,7 +497,7 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     /* Check SID length is valid */
-    sidl_limit = (lb_timeout > 0) ? 7 : ((alg == QUIC_LB_PCID) ? 16 :
+    sidl_limit = ((alg == QUIC_LB_PCID) ? 16 :
          ((alg == QUIC_LB_SCID) ? 11 : 12));
     if (((ngx_uint_t)sidl) > sidl_limit) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "SID Length is too large");
@@ -788,8 +562,6 @@ ngx_stream_upstream_quic_lb(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         qlbcf->min_cidl[cr] = 1 + sidl + nonce_len;
         break;
     }
-    qlbcf->sidl[cr] = sidl;
-    qlbcf->lb_timeout[cr] = (ngx_uint_t)lb_timeout;
 
     uscf->peer.init_upstream = ngx_stream_upstream_init_quic_lb;
 
