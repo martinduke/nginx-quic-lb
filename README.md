@@ -14,14 +14,17 @@ make
 sudo make install
 ```
 
+At a minimum, you will need --with-stream and --with-stream_ssl_module for
+flags.
+
 # Config instructions
 Add something like this example to your nginx.conf file:
 
 ```
 stream {
     upstream server_pool {
-        quic-lb cr=0 sidl=4;
-        quic-lb cr=1 sidl=6 key=abcdefabcdefabcdefabcdefabcdefab; 
+        quic-lb cr=0 sidl=4 nonce_len=4;
+        quic-lb cr=1 sidl=6 key=abcdefabcdefabcdefabcdefabcdefab nonce_len=10;
         quic-lb cr=2 sidl=4 key=fedcbafedcbafedcbafedcbafedcbafe nonce_len=8;
         server <addr>:<port> sid0=01234567 sid1=89abcdef0123 sid2=456789ab;
         server <addr>:<port> sid0=23456789 sid1=abcdef012345 sid2=6789abcd;
@@ -35,13 +38,6 @@ stream {
 ```
 
 This example specifies support for three different configurations, each assigned to a config rotation codepoint. Each of these configurations, in this example, uses a different algorithm. In general, you would only need one quic-lb line in a production load balancer and would only add a second line when rotating keys in your server pool (see section 3.1 of the spec for more on this).
-
-For dynamic SID allocation, simply add a parameter 'lb-timeout' to one or more
-of the quic-lb lines, with a value (in seconds) greater than zero and responding
-to how long a SID allocation can be unused before returning to the pool. For a
-cr that is dynamically allocated, you need not assign an SID. For example, if
-cr=1 has a nonzero lb-timeout value, there is no need to attach an sid1
-parameter to any pool member.
 
 Then type
 
