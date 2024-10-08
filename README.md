@@ -3,6 +3,8 @@ This is a deployable implementation of the load balancer side of the QUIC-LB pro
 
 See https://quicwg.org/load-balancers/draft-ietf-quic-load-balancers.html for the specification that defines this implementation.
 
+Please note that this has not been maintained for years, and has badly bit-rotted. Contributions to update this code are welcome.
+
 # Installation instructions
 
 ```
